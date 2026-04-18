@@ -1,0 +1,10 @@
+~ $ cat text.txt && cat bulletin.txt
+FTUS43 KBOU,ops_denver.txt,forecast_archive.txt
+WFUS53 *,all_warnings.txt
+* KBOU,origin_kbou.txt
+*,catchall.txt
+ZCZC
+FTUS43 KBOU 181130
+TAFDEN
+TAF KDEN 181130Z 1812/1918 14008KT P6SM SCT080
+=
