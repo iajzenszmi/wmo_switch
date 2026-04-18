@@ -1,0 +1,363 @@
+nano
+~ $ g++ wmo_switch.cpp -c
+~ $ g++ wmo_switch.cpp -o wmoswitch
+~ $ nano text.txt
+~ $ nano bulletin.txt
+~ $ nano bulletin.txt
+~ $ ./wmoswitch text.txt bulletin.txt
+Parsed heading: FTUS43 KBOU 181130
+Delivered to ops_denver.txt
+Delivered to forecast_archive.txt
+~ $ cat wmo_switch.cpp
+/*
+ * wmo_switch.cpp
+ *
+ * Safer C++ version of a WMO bulletin switch.
+ *
+ * Build:
+ *   g++ -O2 -Wall -Wextra -pedantic -std=c++17 wmo_switch.cpp -o wmo_switch
+ *
+ * Run:
+ *   ./wmo_switch routes.txt bulletin.txt
+ *   cat bulletin.txt | ./wmo_switch routes.txt
+ *
+ * Route file format:
+ *   KEY,DEST1,DEST2,DEST3,...
+ *
+ * Examples:
+ *   FTUS43 KBOU,ops_denver.txt,forecast_archive.txt
+ *   WFUS53 *,all_warnings.txt
+ *   * KBOU,origin_kbou.txt
+ *   *,catchall.txt
+ */
+
+#include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <iostream>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+struct WmoHeader {
+    std::string ttaaii;       // 6 chars
+    std::string cccc;         // 4 chars
+    std::string yygggg;       // 6 chars
+    std::string bbb;          // optional 3 chars
+    bool has_bbb = false;
+    std::string matched_line;
+};
+
+struct Route {
+    std::string key;
+    std::vector<std::string> destinations;
+};
+
+/* ---------------------------
+   DATA DICTIONARY / ASSUMPTIONS
+   ---------------------------
+   ttaaii:
+     WMO data designator group, 6 alphanumeric characters.
+
+   cccc:
+     Originating centre, 4 alphanumeric characters.
+
+   yygggg:
+     Day/time group, 6 alphanumeric characters.
+
+   bbb:
+     Optional 3-character correction/amendment indicator.
+
+   key:
+     Routing key:
+       "TTAAii CCCC"
+       "TTAAii *"
+       "* CCCC"
+       "*"
+
+   destinations:
+     Output destinations. In this demo they are file paths.
+*/
+
+static std::string trim(const std::string& s) {
+    std::size_t start = 0;
+    while (start < s.size() &&
+           std::isspace(static_cast<unsigned char>(s[start]))) {
+        ++start;
+    }
+
+    std::size_t end = s.size();
+    while (end > start &&
+           std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+        --end;
+    }
+
+    return s.substr(start, end - start);
+}
+
+static std::string to_upper(std::string s) {
+    for (char& ch : s) {
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    }
+    return s;
+}
+
+static bool is_alnum_n(const std::string& s, std::size_t n) {
+    if (s.size() != n) {
+        return false;
+    }
+    for (char ch : s) {
+        if (!std::isalnum(static_cast<unsigned char>(ch))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::vector<std::string> split_csv_simple(const std::string& line) {
+    std::vector<std::string> parts;
+    std::string current;
+
+    for (char ch : line) {
+        if (ch == ',') {
+            parts.push_back(trim(current));
+            current.clear();
+        } else {
+            current.push_back(ch);
+        }
+    }
+    parts.push_back(trim(current));
+    return parts;
+}
+
+static std::optional<WmoHeader> parse_wmo_heading_line(const std::string& line) {
+    std::string up = to_upper(trim(line));
+    if (up.empty()) {
+        return std::nullopt;
+    }
+
+    std::istringstream iss(up);
+    std::string t1, t2, t3, t4;
+    if (!(iss >> t1 >> t2 >> t3)) {
+        return std::nullopt;
+    }
+    (void)(iss >> t4);
+
+    if (!is_alnum_n(t1, 6)) {
+        return std::nullopt;
+    }
+    if (!is_alnum_n(t2, 4)) {
+        return std::nullopt;
+    }
+    if (!is_alnum_n(t3, 6)) {
+        return std::nullopt;
+    }
+
+    WmoHeader hdr;
+    hdr.ttaaii = t1;
+    hdr.cccc = t2;
+    hdr.yygggg = t3;
+
+    if (!t4.empty() && is_alnum_n(t4, 3)) {
+        hdr.bbb = t4;
+        hdr.has_bbb = true;
+    }
+
+    hdr.matched_line = hdr.ttaaii + " " + hdr.cccc + " " + hdr.yygggg;
+    if (hdr.has_bbb) {
+        hdr.matched_line += " " + hdr.bbb;
+    }
+
+    return hdr;
+}
+
+static std::optional<WmoHeader> find_wmo_heading(const std::string& message) {
+    std::istringstream iss(message);
+    std::string line;
+
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+
+        auto hdr = parse_wmo_heading_line(line);
+        if (hdr.has_value()) {
+            return hdr;
+        }
+    }
+
+    return std::nullopt;
+}
+
+static std::optional<Route> parse_route_line(const std::string& input) {
+    std::string line = trim(input);
+    if (line.empty() || line[0] == '#') {
+        return std::nullopt;
+    }
+
+    std::vector<std::string> fields = split_csv_simple(line);
+    if (fields.size() < 2) {
+        std::cerr << "Bad route line (need key and at least one destination): "
+                  << line << "\n";
+        return std::nullopt;
+    }
+
+    Route route;
+    route.key = to_upper(trim(fields[0]));
+    if (route.key.empty()) {
+        std::cerr << "Bad route line (empty key)\n";
+        return std::nullopt;
+    }
+
+    for (std::size_t i = 1; i < fields.size(); ++i) {
+        if (!fields[i].empty()) {
+            route.destinations.push_back(fields[i]);
+        }
+    }
+
+    if (route.destinations.empty()) {
+        std::cerr << "Bad route line (no destinations): " << line << "\n";
+        return std::nullopt;
+    }
+
+    return route;
+}
+
+static std::vector<Route> load_routes(const std::string& path) {
+    std::ifstream in(path);
+    std::vector<Route> routes;
+
+    if (!in) {
+        throw std::runtime_error("Cannot open route file: " + path);
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        auto route = parse_route_line(line);
+        if (route.has_value()) {
+            routes.push_back(*route);
+        }
+    }
+
+    return routes;
+}
+
+static int route_match_rank(const std::string& key, const WmoHeader& hdr) {
+    const std::string exact = hdr.ttaaii + " " + hdr.cccc;
+    const std::string by_ttaaii = hdr.ttaaii + " *";
+    const std::string by_cccc = "* " + hdr.cccc;
+
+    if (key == exact) {
+        return 4;
+    }
+    if (key == by_ttaaii) {
+        return 3;
+    }
+    if (key == by_cccc) {
+        return 2;
+    }
+    if (key == "*") {
+        return 1;
+    }
+    return 0;
+}
+
+static bool write_message_to_destination(const std::string& dest,
+                                         const std::string& message,
+                                         const WmoHeader& hdr) {
+    std::ofstream out(dest, std::ios::app);
+    if (!out) {
+        std::cerr << "Cannot open destination '" << dest << "' for append\n";
+        return false;
+    }
+
+    out << "----- BEGIN BULLETIN -----\n";
+    out << "ROUTED-KEY: " << hdr.ttaaii << " " << hdr.cccc << "\n";
+    out << "HEADING: " << hdr.matched_line << "\n";
+    out << message;
+    if (!message.empty() && message.back() != '\n') {
+        out << "\n";
+    }
+    out << "----- END BULLETIN -----\n\n";
+
+    return true;
+}
+
+static std::string read_all_from_stream(std::istream& in) {
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+int main(int argc, char* argv[]) {
+    try {
+        if (argc < 2 || argc > 3) {
+            std::cerr << "Usage: " << argv[0] << " ROUTES_FILE [MESSAGE_FILE]\n";
+            return 1;
+        }
+
+        const std::string routes_path = argv[1];
+        const std::vector<Route> routes = load_routes(routes_path);
+
+        std::string message;
+        if (argc == 3) {
+            std::ifstream in(argv[2], std::ios::binary);
+            if (!in) {
+                std::cerr << "Cannot open message file: " << argv[2] << "\n";
+                return 1;
+            }
+            message = read_all_from_stream(in);
+        } else {
+            message = read_all_from_stream(std::cin);
+        }
+
+        if (message.empty()) {
+            std::cerr << "Input message is empty\n";
+            return 1;
+        }
+
+        auto hdr_opt = find_wmo_heading(message);
+        if (!hdr_opt.has_value()) {
+            std::cerr << "No valid WMO heading found\n";
+            return 1;
+        }
+
+        const WmoHeader& hdr = *hdr_opt;
+        std::cout << "Parsed heading: " << hdr.matched_line << "\n";
+
+        int best_rank = 0;
+        for (const auto& route : routes) {
+            best_rank = std::max(best_rank, route_match_rank(route.key, hdr));
+        }
+
+        if (best_rank == 0) {
+            std::cerr << "No matching route for " << hdr.ttaaii
+                      << " " << hdr.cccc << "\n";
+            return 2;
+        }
+
+        bool delivered = false;
+        for (const auto& route : routes) {
+            if (route_match_rank(route.key, hdr) == best_rank) {
+                for (const auto& dest : route.destinations) {
+                    if (write_message_to_destination(dest, message, hdr)) {
+                        std::cout << "Delivered to " << dest << "\n";
+                        delivered = true;
+                    }
+                }
+            }
+        }
+
+        if (!delivered) {
+            std::cerr << "Route matched but delivery failed\n";
+            return 3;
+        }
+
+        return 0;
+    } catch (const std::exception& ex) {
+        std::cerr << "Fatal error: " << ex.what() << "\n";
+        return 10;
+    }
+}
+~ $
