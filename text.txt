@@ -1,0 +1,4 @@
+FTUS43 KBOU,ops_denver.txt,forecast_archive.txt
+WFUS53 *,all_warnings.txt
+* KBOU,origin_kbou.txt
+*,catchall.txt
